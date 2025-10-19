@@ -1,185 +1,187 @@
 #!/usr/bin/env python3
-# pi_server.py
-# Run on Raspberry Pi (Ubuntu). Streams screen and accepts JSON control messages to inject input.
-# Usage: sudo python3 pi_server.py --host 0.0.0.0 --port 5000 --token S3CR3T
+"""
+pi_server.py — Remote-control server for Raspberry Pi / Ubuntu
+Streams the screen and accepts mouse + keyboard control.
+
+✅ No arguments needed — configure the constants below.
+✅ Works with the controller_client.py you already have.
+"""
 
 import socket
 import threading
-import argparse
 import struct
 import json
 import time
 import io
 import logging
-from PIL import Image
-import mss
 import zlib
 import os
 import subprocess
+import re
+from PIL import Image
+import mss
 
-# Optional: evdev for uinput injection (preferable)
-USE_EVDEV = True
-try:
-    from evdev import UInput, ecodes as e
-except Exception:
-    USE_EVDEV = False
-    logging.info("evdev not available, will fallback to xdotool for input injection (X11 only)")
+# ==================== CONFIGURATION ====================
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+TOKEN = "S3CR3T"          # Must match the client's token
+HOST = "0.0.0.0"          # Listen on all interfaces
+PORT = 5000               # Port to use
+DISPLAY = ":1"            # Your active X display (e.g., ":0" or ":1")
+FRAME_SCALE = 0.7         # 0.7 = 70% size, adjust for performance
+JPEG_QUALITY = 60         # 1–100 (higher = better quality, slower)
+FRAME_DELAY = 0.05        # ~20 FPS (lower = faster stream)
+# =======================================================
 
-class InputInjector:
-    def __init__(self):
-        if USE_EVDEV:
-            caps = {
-                e.EV_KEY: [i for i in range(1, 0x2ff)],
-                e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
-            }
-            try:
-                self.ui = UInput(caps, name="py-remote-uinput")
-                logging.info("UInput created")
-            except Exception as ex:
-                logging.exception("Failed to create UInput, falling back to xdotool")
-                self.ui = None
-        else:
-            self.ui = None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-    def mouse_move(self, dx, dy):
-        if self.ui:
-            self.ui.write(e.EV_REL, e.REL_X, int(dx))
-            self.ui.write(e.EV_REL, e.REL_Y, int(dy))
-            self.ui.syn()
-        else:
-            # fallback: use xdotool to move relative (requires X11)
-            subprocess.call(['xdotool', 'mousemove_relative', '--', str(int(dx)), str(int(dy))])
+# === Utility functions ===
+def send_json(sock, obj):
+    data = json.dumps(obj).encode("utf8")
+    sock.sendall(struct.pack("!I", len(data)))
+    sock.sendall(data)
 
-    def mouse_button(self, button, pressed):
-        if button == 'left': b = '1'
-        elif button == 'right': b = '3'
-        else: b = '2'
-        action = 'mousedown' if pressed else 'mouseup'
-        if self.ui:
-            code = {'left': e.BTN_LEFT, 'right': e.BTN_RIGHT, 'middle': e.BTN_MIDDLE}.get(button, e.BTN_LEFT)
-            self.ui.write(e.EV_KEY, code, 1 if pressed else 0)
-            self.ui.syn()
-        else:
-            subprocess.call(['xdotool', action, b])
-
-    def key_event(self, key, pressed):
-        # very naive mapping: for letters & basic keys, use xdotool fallback if needed
-        if self.ui:
-            # map some keys simply; extend as needed
-            keyname = key.lower()
-            if len(keyname) == 1:
-                # a..z
-                code = getattr(e, 'KEY_' + keyname.upper(), None)
-            else:
-                code = None
-            if code:
-                self.ui.write(e.EV_KEY, code, 1 if pressed else 0)
-                self.ui.syn()
-                return
-        # fallback to xdotool
-        if pressed:
-            subprocess.call(['xdotool', 'keydown', key])
-        else:
-            subprocess.call(['xdotool', 'keyup', key])
-
-injector = InputInjector()
-
-# frame sending helpers
-def send_frame(sock, jpeg_bytes):
-    # send: 4-byte length, then zlib-compressed jpeg
-    compressed = zlib.compress(jpeg_bytes, level=6)
-    sock.sendall(struct.pack('!I', len(compressed)))
-    sock.sendall(compressed)
-
-def recv_json(sock):
-    # each JSON message is length-prefixed with 4 bytes
+def recv_json_sock(sock):
     header = sock.recv(4)
     if not header:
         return None
-    (n,) = struct.unpack('!I', header)
-    data = b''
+    (n,) = struct.unpack("!I", header)
+    data = b""
     while len(data) < n:
         chunk = sock.recv(n - len(data))
         if not chunk:
             break
         data += chunk
-    return json.loads(data.decode('utf8'))
-
-def send_json(sock, obj):
-    data = json.dumps(obj).encode('utf8')
-    sock.sendall(struct.pack('!I', len(data)))
-    sock.sendall(data)
-
-def handle_client(conn, addr, token):
-    logging.info("Client connected %s", addr)
     try:
-        # expect auth JSON first
-        auth = recv_json(conn)
-        if not auth or auth.get('auth') != token:
-            logging.warning("Auth failed from %s", addr)
+        return json.loads(data.decode("utf8")), True
+    except Exception:
+        return data, False
+
+def send_frame(sock, jpg_bytes):
+    compressed = zlib.compress(jpg_bytes, level=6)
+    sock.sendall(struct.pack("!I", len(compressed)))
+    sock.sendall(compressed)
+
+# === Detect screen resolution ===
+def get_screen_size(display=DISPLAY):
+    try:
+        env = dict(os.environ)
+        env["DISPLAY"] = display
+        out = subprocess.check_output(["xdpyinfo"], env=env, text=True, stderr=subprocess.DEVNULL)
+        m = re.search(r"dimensions:\s+(\d+)x(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None, None
+
+# === Xdotool control functions ===
+def xdotool(cmd_args, display=DISPLAY):
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    subprocess.run(["xdotool"] + cmd_args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def mouse_abs(x, y, btn, pressed, display=DISPLAY):
+    xdotool(["mousemove", "--sync", str(x), str(y)], display)
+    if pressed:
+        xdotool(["mousedown", "1" if btn == "left" else "3"], display)
+    else:
+        xdotool(["mouseup", "1" if btn == "left" else "3"], display)
+
+def key_action(key, pressed, display=DISPLAY):
+    action = "keydown" if pressed else "keyup"
+    xdotool([action, str(key)], display)
+
+# === Main connection handler ===
+def handle_client(conn, addr):
+    logging.info(f"Client connected: {addr}")
+
+    try:
+        data, is_json = recv_json_sock(conn)
+        if not is_json or not isinstance(data, dict) or data.get("auth") != TOKEN:
+            logging.warning(f"Auth failed from {addr}")
             conn.close()
             return
-        logging.info("Authenticated %s", addr)
+        logging.info(f"Authenticated {addr}")
 
-        # start a thread to read incoming control messages
+        # Send screen size to client
+        w, h = get_screen_size()
+        if w and h:
+            send_json(conn, {"type": "screen_size", "width": w, "height": h})
+            logging.info(f"Sent screen size {w}x{h}")
+        else:
+            logging.warning("Could not detect screen size")
+
+        # Thread for control messages
+        stop_event = threading.Event()
+
         def reader():
-            while True:
-                try:
-                    msg = recv_json(conn)
-                    if msg is None:
-                        break
-                    typ = msg.get('type')
-                    if typ == 'mouse_move':
-                        injector.mouse_move(msg.get('dx',0), msg.get('dy',0))
-                    elif typ == 'mouse_button':
-                        injector.mouse_button(msg.get('button','left'), msg.get('pressed', True))
-                    elif typ == 'key':
-                        injector.key_event(msg.get('key'), msg.get('pressed', True))
-                except Exception as ex:
-                    logging.exception("Reader error")
+            while not stop_event.is_set():
+                res = recv_json_sock(conn)
+                if res is None:
                     break
-            logging.info("Reader thread ending")
-        t = threading.Thread(target=reader, daemon=True)
-        t.start()
+                payload, is_json = res
+                if not is_json:
+                    continue
+                typ = payload.get("type")
+                if typ == "mouse_abs":
+                    mouse_abs(int(payload["x"]), int(payload["y"]),
+                              payload.get("button", "left"),
+                              payload.get("pressed", True))
+                elif typ == "mouse_button":
+                    btn = 1 if payload.get("button") == "left" else 3
+                    if payload.get("pressed"):
+                        xdotool(["mousedown", str(btn)])
+                    else:
+                        xdotool(["mouseup", str(btn)])
+                elif typ == "key":
+                    key_action(payload.get("key"), payload.get("pressed", True))
+                elif typ == "mouse_move":
+                    dx, dy = payload.get("dx", 0), payload.get("dy", 0)
+                    env = dict(os.environ); env["DISPLAY"] = DISPLAY
+                    out = subprocess.check_output(["xdotool", "getmouselocation", "--shell"], env=env, text=True)
+                    x = int(re.search(r"X=(\d+)", out).group(1))
+                    y = int(re.search(r"Y=(\d+)", out).group(1))
+                    xdotool(["mousemove", "--sync", str(x + dx), str(y + dy)], display=DISPLAY)
 
-        # main loop: capture screen and send frames
+        threading.Thread(target=reader, daemon=True).start()
+
+        # Stream frames
         with mss.mss() as sct:
-            monitor = sct.monitors[1]  # primary
+            mon = sct.monitors[1]
             while True:
-                img = sct.grab(monitor)
-                pil = Image.frombytes('RGB', img.size, img.rgb)
-                # resize to reduce bandwidth (optional)
-                pil = pil.resize((int(img.width*0.6), int(img.height*0.6)))
+                img = sct.grab(mon)
+                pil = Image.frombytes("RGB", img.size, img.rgb)
+                pil = pil.resize((int(img.width * FRAME_SCALE), int(img.height * FRAME_SCALE)))
                 buf = io.BytesIO()
-                pil.save(buf, format='JPEG', quality=60)
-                jpg = buf.getvalue()
-                send_frame(conn, jpg)
-                time.sleep(0.05)
-    except Exception as ex:
-        logging.exception("Client handler error")
+                pil.save(buf, format="JPEG", quality=JPEG_QUALITY)
+                send_frame(conn, buf.getvalue())
+                time.sleep(FRAME_DELAY)
+    except Exception as e:
+        logging.exception(f"Client error: {e}")
     finally:
         try:
             conn.close()
         except:
             pass
-        logging.info("Connection closed %s", addr)
+        logging.info(f"Connection closed: {addr}")
 
+# === Main server loop ===
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--host', default='0.0.0.0')
-    parser.add_argument('--port', type=int, default=5000)
-    parser.add_argument('--token', required=True)
-    args = parser.parse_args()
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind((args.host, args.port))
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((HOST, PORT))
     sock.listen(1)
-    logging.info("Server listening on %s:%d", args.host, args.port)
-    while True:
-        conn, addr = sock.accept()
-        threading.Thread(target=handle_client, args=(conn, addr, args.token), daemon=True).start()
+    logging.info(f"Server started on {HOST}:{PORT}, display={DISPLAY}")
+    logging.info(f"Auth token: {TOKEN}")
 
-if __name__ == '__main__':
+    try:
+        while True:
+            conn, addr = sock.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+    except KeyboardInterrupt:
+        logging.info("Shutting down.")
+    finally:
+        sock.close()
+
+if __name__ == "__main__":
     main()
