@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pi Screen Share (demo)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    #video { border: 1px solid #444; width: 960px; height: 540px; background: #000; }
+    #controls { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Pi Screen Share (demo)</h2>
+  <video id="video" autoplay playsinline></video>
+  <div id="controls">
+    <button id="start">Start</button>
+    <span id="status"></span>
+  </div>
+
+<script>
+let pc;
+let dc;
+const video = document.getElementById('video');
+const startBtn = document.getElementById('start');
+const status = document.getElementById('status');
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  status.textContent = 'Starting...';
+
+  pc = new RTCPeerConnection();
+
+  // show remote video
+  pc.ontrack = (event) => {
+    video.srcObject = event.streams[0];
+  };
+
+  // create a data channel for input
+  dc = pc.createDataChannel('input');
+  dc.onopen = () => status.textContent = 'Connected';
+  dc.onclose = () => status.textContent = 'DataChannel closed';
+
+  // create offer
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // send offer to server
+  const resp = await fetch('/offer', {
+    method: 'POST',
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+    headers: { 'Content-Type': 'application/json' }
+  });
+  const answer = await resp.json();
+  await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+
+  // mouse click handling on video -> send absolute coords (mapped to remote resolution)
+  video.addEventListener('click', (ev) => {
+    const rect = video.getBoundingClientRect();
+    const cx = ev.clientX - rect.left;
+    const cy = ev.clientY - rect.top;
+    // assume remote is same resolution; for real app server should send actual resolution via DC
+    // Here we send fractional coords and server/client can multiply by actual remote resolution if known
+    const fx = cx / rect.width;
+    const fy = cy / rect.height;
+    const msg = JSON.stringify({ type: 'mouse_click_frac', fx: fx, fy: fy });
+    if (dc && dc.readyState === 'open') dc.send(msg);
+  });
+
+  // Keep DC events (optional)
+  pc.oniceconnectionstatechange = () => {
+    console.log('ice state', pc.iceConnectionState);
+    if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+      status.textContent = 'Disconnected';
+    }
+  };
+};
+</script>
+</body>
+</html>
