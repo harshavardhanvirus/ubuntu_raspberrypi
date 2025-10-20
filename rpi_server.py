@@ -1,136 +1,199 @@
 #!/usr/bin/env python3
 """
-Simple remote-control server for Raspberry Pi or Ubuntu
-Streams screen and accepts mouse + keyboard inputs.
+webrtc_server.py
+Simple aiortc-based WebRTC server that captures the desktop and sends it to a browser.
+Also listens on a DataChannel for input events (mouse_abs / key) and injects them locally.
+
+Usage:
+    DISPLAY=:1 python3 webrtc_server.py
+Open http://<PI_IP>:8080 in your browser and click "Start".
 """
 
-import socket, threading, struct, json, time, io, zlib, subprocess, os, re, logging
-from PIL import Image
+import asyncio
+import json
+import os
+import logging
+import argparse
+from aiohttp import web
+import aiohttp_jinja2, jinja2
+
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc.contrib.media import MediaBlackhole
+from aiortc.rtcrtpsender import RTCRtpSender
+from av import VideoFrame
+
 import mss
+from PIL import Image, ImageDraw
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+import subprocess
+import re
+import time
 
-# === CONFIG ===
-TOKEN   = "S3CR3T"       # must match client
-HOST    = "0.0.0.0"
-PORT    = 5000
-DISPLAY = ":1"            # your X display (":0" or ":1")
-# ===============
+logging.basicConfig(level=logging.INFO)
+ROOT = os.path.dirname(__file__)
 
-def send_json(sock, obj):
-    data = json.dumps(obj).encode('utf8')
-    sock.sendall(struct.pack('!I', len(data)))
-    sock.sendall(data)
+# ---------------- Config ----------------
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = 8080
+DISPLAY_ENV = os.environ.get("DISPLAY", ":1")   # ensure you run with DISPLAY set
+# ----------------------------------------
 
-def recv_json(sock):
-    header = sock.recv(4)
-    if not header:
-        return None
-    (n,) = struct.unpack('!I', header)
-    data = b''
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            break
-        data += chunk
-    try:
-        return json.loads(data.decode('utf8'))
-    except:
-        return None
+# aiohttp + jinja setup
+app = web.Application()
+aiohttp_jinja2.setup(app, loader=jinja2.FileSystemLoader(os.path.join(ROOT, "static")))
 
-def send_frame(sock, jpg):
-    compressed = zlib.compress(jpg, 6)
-    sock.sendall(struct.pack('!I', len(compressed)))
-    sock.sendall(compressed)
+pcs = set()
 
-def get_screen_size():
+# utility to inject input (xdotool path)
+def inject_mouse_abs(x, y, button='left', pressed=True, display=DISPLAY_ENV):
     try:
         env = dict(os.environ)
-        env["DISPLAY"] = DISPLAY
-        out = subprocess.check_output(['xdpyinfo'], env=env, text=True)
-        m = re.search(r'dimensions:\s+(\d+)x(\d+)', out)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-    except:
-        pass
-    return None, None
+        env['DISPLAY'] = display
+        # move then down/up
+        subprocess.run(['xdotool', 'mousemove', '--sync', str(x), str(y)], env=env)
+        if pressed:
+            subprocess.run(['xdotool', 'mousedown', '1' if button=='left' else '3'], env=env)
+        else:
+            subprocess.run(['xdotool', 'mouseup', '1' if button=='left' else '3'], env=env)
+    except Exception as e:
+        logging.exception("inject_mouse_abs failed: %s", e)
 
-def xdotool(args):
-    env = dict(os.environ)
-    env['DISPLAY'] = DISPLAY
-    subprocess.run(['xdotool'] + args, env=env)
+def inject_key(key, pressed=True, display=DISPLAY_ENV):
+    try:
+        env = dict(os.environ)
+        env['DISPLAY'] = display
+        if pressed:
+            subprocess.run(['xdotool', 'keydown', str(key)], env=env)
+        else:
+            subprocess.run(['xdotool', 'keyup', str(key)], env=env)
+    except Exception as e:
+        logging.exception("inject_key failed: %s", e)
 
-def handle_client(conn, addr):
-    logging.info(f"Client connected: {addr}")
-    data = recv_json(conn)
-    if not data or data.get('auth') != TOKEN:
-        logging.warning("Auth failed")
-        conn.close()
-        return
-    logging.info("Client authenticated")
+# ------------- Video Track ----------------
+class ScreenTrack(VideoStreamTrack):
+    """
+    A VideoStreamTrack that captures the desktop using mss and yields VideoFrame objects.
+    We overlay a simple cursor for demo purposes using PIL.
+    """
+    def __init__(self, display=DISPLAY_ENV, fps=15, scale=1.0):
+        super().__init__()  # don't forget
+        self.sct = mss.mss()
+        self.monitor = self.sct.monitors[1]
+        self.fps = fps
+        self.frame_time = 1.0 / fps
+        self.scale = scale
+        self._last_ts = None
 
-    w, h = get_screen_size()
-    if w and h:
-        send_json(conn, {'type': 'screen_size', 'width': w, 'height': h})
-        logging.info(f"Sent screen size {w}x{h}")
+    async def recv(self):
+        # adhere to required timing
+        pts, time_base = await self.next_timestamp()
+        # grab screen
+        img = self.sct.grab(self.monitor)
+        pil = Image.frombytes('RGB', img.size, img.rgb)
+        # optionally scale down to reduce bandwidth
+        if self.scale != 1.0:
+            w = int(pil.width * self.scale)
+            h = int(pil.height * self.scale)
+            pil = pil.resize((w, h), Image.LANCZOS)
 
-    stop = False
+        # overlay cursor: get x,y via xdotool
+        try:
+            env = dict(os.environ); env['DISPLAY'] = DISPLAY_ENV
+            out = subprocess.check_output(['xdotool', 'getmouselocation', '--shell'], env=env, text=True)
+            m = re.search(r'X=(\d+)', out)
+            n = re.search(r'Y=(\d+)', out)
+            if m and n:
+                cx = int(m.group(1))
+                cy = int(n.group(1))
+                # adjust for scaling
+                if self.scale != 1.0:
+                    cx = int(cx * self.scale)
+                    cy = int(cy * self.scale)
+                draw = ImageDraw.Draw(pil)
+                # simple cursor marker (white circle with black border)
+                r = max(2, int(pil.width * 0.01))  # radius relative to size
+                draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=(255,255,255))
+                draw.ellipse((cx-r-1, cy-r-1, cx+r+1, cy+r+1), outline=(0,0,0))
+        except Exception:
+            pass
 
-    def reader():
-        nonlocal stop
-        while not stop:
+        # convert to VideoFrame
+        frame = VideoFrame.from_image(pil)
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
+
+# ------------- Web handlers ----------------
+@aiohttp_jinja2.template('client.html')
+async def index(request):
+    return {}
+
+async def offer(request):
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params['sdp'], type=params['type'])
+
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+    logging.info("Created PC %s", pc)
+
+    # prepare track and advertise width/height to client via DataChannel after negotiation
+    screen = ScreenTrack()
+    pc.addTrack(screen)
+
+    # DataChannel handling
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        logging.info("DataChannel created: %s", channel.label)
+
+        @channel.on("message")
+        def on_message(message):
+            # expect JSON messages like {"type":"mouse_abs","x":100,"y":200,"button":"left","pressed":true}
             try:
-                header = conn.recv(4)
-                if not header:
-                    break
-                (n,) = struct.unpack('!I', header)
-                data = conn.recv(n)
-                msg = json.loads(data.decode())
-                typ = msg.get('type')
-                if typ == 'mouse_abs':
-                    x, y = int(msg['x']), int(msg['y'])
-                    btn = msg.get('button', 'left')
-                    pressed = msg.get('pressed', True)
-                    b = '1' if btn == 'left' else '3'
-                    xdotool(['mousemove', '--sync', str(x), str(y)])
-                    xdotool(['mousedown' if pressed else 'mouseup', b])
-                elif typ == 'key':
-                    key = msg.get('key')
-                    pressed = msg.get('pressed', True)
-                    xdotool(['keydown' if pressed else 'keyup', str(key)])
-            except Exception as e:
-                logging.warning(f"Reader error: {e}")
-                break
-        stop = True
+                if isinstance(message, str):
+                    obj = json.loads(message)
+                else:
+                    obj = json.loads(message.decode('utf8'))
+            except Exception:
+                logging.warning("Invalid DC message")
+                return
+            typ = obj.get('type')
+            if typ == 'mouse_abs':
+                x = int(obj.get('x',0)); y = int(obj.get('y',0))
+                button = obj.get('button','left'); pressed = obj.get('pressed', True)
+                logging.debug("Inject mouse_abs %s,%s %s %s", x, y, button, pressed)
+                inject_mouse_abs(x, y, button, pressed, display=DISPLAY_ENV)
+            elif typ == 'key':
+                key = obj.get('key'); pressed = obj.get('pressed', True)
+                inject_key(key, pressed, display=DISPLAY_ENV)
+            else:
+                logging.debug("DC unknown type %s", typ)
 
-    threading.Thread(target=reader, daemon=True).start()
+    # set remote description
+    await pc.setRemoteDescription(offer)
+    # create answer
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
 
-    with mss.mss() as sct:
-        mon = sct.monitors[1]
-        while not stop:
-            img = sct.grab(mon)
-            pil = Image.frombytes('RGB', img.size, img.rgb)
-            pil = pil.resize((int(img.width * 0.7), int(img.height * 0.7)))
-            buf = io.BytesIO()
-            pil.save(buf, format='JPEG', quality=60)
-            jpg = buf.getvalue()
-            try:
-                send_frame(conn, jpg)
-            except:
-                break
-            time.sleep(0.05)
-    conn.close()
-    logging.info("Connection closed")
+    return web.json_response({'sdp': pc.localDescription.sdp, 'type': pc.localDescription.type})
 
-def main():
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((HOST, PORT))
-    s.listen(1)
-    logging.info(f"Server listening on {HOST}:{PORT}")
-    while True:
-        c, a = s.accept()
-        threading.Thread(target=handle_client, args=(c,a), daemon=True).start()
+async def on_shutdown(app):
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
 
+# routes
+app.router.add_get('/', index)
+app.router.add_post('/offer', offer)
+app.on_shutdown.append(on_shutdown)
+app.router.add_static('/static/', path=os.path.join(ROOT, 'static'), name='static')
+
+# server run
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--host', default=LISTEN_HOST)
+    parser.add_argument('--port', type=int, default=LISTEN_PORT)
+    parser.add_argument('--display', default=DISPLAY_ENV)
+    args = parser.parse_args()
+    DISPLAY_ENV = args.display
+    logging.info("Starting server on %s:%d (DISPLAY=%s)", args.host, args.port, DISPLAY_ENV)
+    web.run_app(app, host=args.host, port=args.port)
