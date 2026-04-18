@@ -1,0 +1,30 @@
+import cv2
+
+# Load image
+image = cv2.imread("people.jpg")
+
+# Initialize HOG person detector
+hog = cv2.HOGDescriptor()
+hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+# Detect people
+boxes, weights = hog.detectMultiScale(
+    image,
+    winStride=(8,8),
+    padding=(8,8),
+    scale=1.05
+)
+
+# Count people
+person_count = len(boxes)
+
+# Draw boxes
+for (x, y, w, h) in boxes:
+    cv2.rectangle(image, (x,y), (x+w,y+h), (0,255,0), 2)
+
+print("Number of persons detected:", person_count)
+
+# Show output
+cv2.imshow("People Count", image)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
