@@ -1,0 +1,30 @@
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+code = """
+def divide(a,b):
+    return a/b
+
+print(divide(10,0))
+"""
+
+prompt = f"""
+Review this Python code.
+
+Provide:
+1. Bugs
+2. Performance improvements
+3. Security concerns
+4. Refactored suggestions
+
+Code:
+{code}
+"""
+
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt
+)
+
+print(response.text)
