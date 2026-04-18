@@ -1,0 +1,21 @@
+import yt_dlp
+
+channel_url = "https://www.youtube.com/@Google/videos"
+
+ydl_opts = {
+    "extract_flat": True,
+    "quiet": True
+}
+
+all_videos = []
+
+with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    info = ydl.extract_info(channel_url, download=False)
+
+    for video in info["entries"]:
+        all_videos.append(video["title"])
+
+for v in all_videos:
+    print(v)
+
+print("Total videos:", len(all_videos))
