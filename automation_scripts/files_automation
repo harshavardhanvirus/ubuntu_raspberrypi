@@ -1,0 +1,31 @@
+import os
+import shutil
+
+source_folder = "Downloads"
+
+folders = {
+    "Images": [".jpg", ".png"],
+    "Documents": [".pdf", ".docx"],
+    "Videos": [".mp4"]
+}
+
+for file in os.listdir(source_folder):
+
+    file_path = os.path.join(source_folder, file)
+
+    if os.path.isfile(file_path):
+
+        ext = os.path.splitext(file)[1].lower()
+
+        for folder, extensions in folders.items():
+
+            if ext in extensions:
+
+                destination = os.path.join(source_folder, folder)
+
+                os.makedirs(destination, exist_ok=True)
+
+                shutil.move(file_path,
+                            os.path.join(destination, file))
+
+                print(f"Moved {file} to {folder}")
